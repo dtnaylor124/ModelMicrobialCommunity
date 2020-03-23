@@ -1,0 +1,1636 @@
+---
+title: "Code for Analyses used in McClure et al. 2020: Reproducible Storage, Reconstitution and Analysis of a Model Microbial Community Representing a Marginal Soil"
+output: html_document
+out_width: 50%
+---
+
+In this paper, a series of model microbial consortia were generated through plating dilutions of native soil on
+a media of soil extract with chitin. 
+
+(1) Prosser field soil was diluted in PBS buffer at three dilutions, then incubated on soil extract + chitin media
+for 8 weeks with weekly replating in order to generate reduced complexity (<100 members) consortia.
+
+(2) One of these communities was 'dissected' into individual isolates through plating
+on multiple types of media, and the resultant isolates were analyzed to determine how isogenic, if at all, they were.
+
+(3) All consortia were then tested to see if methods of long-term storage (glycerol storage or lyophilization) altered
+consortia composition significantly, through comparing the parent communities with the reconstituted communities; in one
+case (the consortia 10^-4 PART C, aka 'C2' or alternatively 'MSC-1') a second generation was included to determine if
+repeated reconstitution affected composition.
+
+(4) All consortia were then used to re-inoculate soils under multiple types of perturbations, in order to analyze the types
+of shifts in consortia composition that occur under each perturbation, particularly with respect to microbial networks and
+co-abundance patterns.
+
+The goal of this document is to provide a comprehensive set of scripts for the R analyses used in the C2 paper, for each of
+these main tasks.
+
+
+# Setup:
+
+```{r setup, results='hide', warning=F, include = F, message = FALSE, echo = F}
+
+library("rmarkdown")
+library("ggplot2")
+library("reshape2")
+library("ggrepel")
+library("scales")
+library("RColorBrewer")
+library("viridis")
+library("vegan")
+library("betapart")
+library("multcomp")
+library("tidyr")
+library("broom")
+library("plyr")
+library("dplyr")
+library("stringr")
+library("ztable")
+library("cowplot")
+library("phyloseq")
+library("colorspace")
+library("scales")
+library("labdsv")
+library("ggplotify")
+library("igraph")
+
+theme_set(theme_cowplot())
+theme_set(theme_bw() + theme(strip.background = element_blank()))
+set.seed(711)
+knitr::opts_chunk$set(cache=TRUE)
+
+```
+
+
+## 1) Generating consortia through incubations on soil extract + chitin plate media.
+
+In this set of experiments, soil inoculations at three different dilutions (10^-2, 10^-3, 10^-4)
+were plated on soil extract + 100 ppm chitin. 8 reps each (labeled 'A-H') for either 'full' communities
+(i.e. the whole plate was replated) or 'part' communities (i.e. only one section of the initial plate
+was replated) were incubated for 8 weeks. Plates were replated on a weekly basis, at which point samples
+were taken for community analyses.
+
+# 1.1) Importing biom/tree data for initial plate experiments:
+
+```{r 1.1-import-plating-data, include = FALSE, eval = TRUE, message = FALSE}
+
+# Load the plating data.
+unrar.plating <- import_biom("../data/plating.biom", "../data/plating.tree")
+metadata.plating <- import_qiime_sample_data("../data/plating_metadata.txt")
+metadata.plating <- select(metadata.plating, Dilution, Community, rep, WeeksIncubated)
+
+# Add levels to the 'Dilution' and 'WeeksIncubated' factors. 'rep' and 'Community' already have levels.
+metadata.plating$Dilution <- revalue(metadata.plating$Dilution, c("10e_2" = "10e-2 Dilution",
+                                                                  "10e_3" = "10e-3 Dilution",
+                                                                  "10e_4" = "10e-4 Dilution",
+                                                                  "10e_5" = "10e-5 Dilution",
+                                                                  "10e_6" = "10e-6 Dilution"))
+metadata.plating$WeeksIncubated <- factor(as.numeric(metadata.plating$WeeksIncubated), levels = c(1,2,3,4,5,6,7,8))
+
+
+# Merge the biom/tree objects with the metadata.
+unrar.plating <- merge_phyloseq(unrar.plating, metadata.plating)
+
+# Rarefy samples to 5000 reads per sample.
+rar.plating <- rarefy_even_depth(unrar.plating, rngseed = 711, sample.size = 5000)
+
+# Add in taxonomic information to the plating information.
+colnames(tax_table(rar.plating)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax_table(rar.plating)[,] <- gsub("^.__", "", tax_table(rar.plating)[,])
+
+
+```
+
+
+# 1.2) Phylum-level relative abundance plot for plating data.
+
+```{r 1.2-phylum-relativeabundanceplot-platingdata, eval = TRUE, message = FALSE, fig.height = 5, fig.width = 13}
+
+# This is a function to generate a melted relative abundance table for the top 'n' phyla (or whichever taxonomic rank you specify).
+# Note that we have this in a later code block as well, I am including it in both places so the chunks can be run independently.
+
+relabundance_melttable <- function(phy, n = 10, rank = "Phylum", species = FALSE){
+  
+  # If the taxa is labeled with a prefix (e.g. p__Proteobacteria rather than Proteobacteria),
+  # we can get rid of that here. Also want to replace '-' in 'Deinococcus-Thermus' with no space.
+  tax_table(phy)[,rank] <- gsub("^.__", "", tax_table(phy)[,rank])
+  tax_table(phy)[,rank] <- gsub("-", "", tax_table(phy)[,rank])
+  
+  # Determine what the top n phyla are. Doing 'n+1' in order to capture the unknown ('?') phylum.
+  top_taxa <- as.list(sort(tapply(taxa_sums(phy), tax_table(phy)[,rank], sum), TRUE)[1:(n+1)]) %>% names()
+ 
+  # If one of the top_taxa is unknown, we want to remove it from this list.
+  top_taxa <- top_taxa[top_taxa != "?"]
+  
+  # If not, we want to remove the extra element so we only have n elements in this list.
+  if(length(top_taxa) > n){
+    top_taxa <- top_taxa[1:(length(top_taxa) - 1)]
+  }
+  print(top_taxa)
+  
+  # Rename the taxa that aren't in the top n to just be "Other".
+  tax_table(phy)[!tax_table(phy)[,rank] %in% top_taxa,rank] <- "Other"
+  
+  if(rank != "Species" & species == FALSE){
+    tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+  }
+  
+  if(species == TRUE){
+    top_taxa <- top_taxa[top_taxa != "Other"]
+    print(top_taxa)
+    tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+  }
+    
+  # In order for us to glom successfully, we need to remove the columns prior to the taxrank we're using. E.g. if using 'Class',
+  # we need to remove 'Domain' and 'Phylum'.
+  tax_table(phy) <- tax_table(phy)[,which(colnames(tax_table(phy)) == rank):length(colnames(tax_table(phy)))]
+  
+  phy.glom <- tax_glom(phy, taxrank = rank)
+  taxa_names(phy.glom) <- tax_table(phy.glom)[,rank]
+  
+  if(taxa_are_rows(phy.glom) == TRUE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(t(otu_table(phy.glom))))
+  }
+  
+  if(taxa_are_rows(phy.glom) == FALSE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(otu_table(phy.glom)))
+  }
+  
+  if("Replicate" %in% colnames(glom.table)){
+    glom.table$Replicate <- as.character(glom.table$Replicate)
+  }
+  
+  glom.melt <- melt(data = glom.table, value.name = "Abundance", variable.name = rank)
+
+  # Remove any NAs.
+  glom.melt <- glom.melt[!is.na(glom.melt[,rank]),]
+  
+  # Having a minor issue with Actinobacteria as a class becoming an NA down the line.
+  glom.melt[,rank] <- gsub("\\.class\\.", "\\(class\\)", glom.melt[,rank])
+
+  # Relevel the taxrank so 'Other' is last.
+  glom.melt[,rank] <- factor(glom.melt[,rank], levels = c(sort(top_taxa), "Other"))
+  
+  return(glom.melt)
+}
+
+
+# Generate the melted order-level dataframe.
+plating.phylum.melt <- relabundance_melttable(rar.plating, n = 10, rank = "Phylum")
+
+# We don't want to graph the 10e-6 dilution in this.
+plating.phylum.melt.2to4 <- plating.phylum.melt[plating.phylum.melt$Dilution != "10e-6 Dilution",]
+
+# Generate a plette to use for this.
+plating.phylum.palette <- c(brewer.pal(10, "Spectral"), "gray34")
+
+## Phylum-level plot.
+plating_phylumplot <- ggplot(data=plating.phylum.melt.2to4,aes(x=WeeksIncubated,y=Abundance,fill=Phylum)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_grid(Dilution ~ Community + rep, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = plating.phylum.palette, drop = FALSE) +
+  theme(axis.text.x=element_text(size = 12, color = "black", hjust = 1),
+        axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_text(size = 24, face = "bold"),
+        text=element_text(size=24)) +
+  xlab("\nWeeks Incubated") + ylab("Relative Abundance\n") + theme(panel.spacing = unit(1, "lines")) +
+  theme(legend.text = element_text(size = 24), plot.title = element_text(size = 30, face = "bold", hjust = 0.5)) +
+  ggtitle("Phylum-Level Relative Abundance for Plating Samples\n") + guides(fill = guide_legend(ncol = 1))
+
+# View the plot.
+plating_phylumplot
+
+# Save the plot.
+save_plot("../figures/Plating_PhylumRelativeAbundance.pdf", plot = plating_phylumplot, base_width = 13, base_height = 5, scale = 1.75)
+
+```
+
+# 1.3) Richness and evenness boxplots for plating samples.
+
+In this code block, we're generating boxplots to investigate the trends of richness (observed unique OTUs)
+and evenness (Simpson's evenness) for Full and Part communities over the 8 weeks of incubation.
+
+```{r 1.3-evenness-richness-diversityplots, eval = TRUE, message = FALSE, fig.height = 4, fig.width = 8}
+
+# Calculate the richness values for the plating samples.
+alpha_div <- estimate_richness(rar.plating, split = TRUE, measures = c("Observed", "Simpson"))
+
+# Create a dataframe where the diversity values are bound along with the sample data, for graphing purposes.
+alpha_table <- cbind(data.frame(sample_data(rar.plating)), alpha_div)
+# alpha_table$Community %>% typeof()
+
+alpha_table_melt <- reshape2::melt(alpha_table, variable.name = "DiversityMetric", value.name = "DiversityValue")
+# Revalue 'Observed' and 'Simpson' to be 'Richness' and 'Evenness' respectively, also make them factor levels.
+alpha_table_melt$DiversityMetric <- factor(alpha_table_melt$DiversityMetric, levels = c("Simpson", "Observed")) %>%
+  revalue(., c("Simpson" = "Evenness", "Observed" = "Richness"))
+
+
+# Specify a palette for the category levels.
+palette_cat <- c("black", "gray34", "darkgreen", "blue", "brown", "purple", "red")
+
+# We aren't considering the 10e-6 dilution here, remove it.
+alpha_table_melt2to4 <- filter(alpha_table_melt, Dilution != "10e-6 Dilution")
+
+# Make the plot.
+alpha_figure_allweeks <- ggplot(alpha_table_melt2to4, aes(x = WeeksIncubated, y = DiversityValue)) +
+  geom_boxplot(aes(color = Dilution)) +
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  facet_grid(Community+DiversityMetric~Dilution, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black"),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+        text=element_text(size=24)) + theme(panel.spacing = unit(2, "lines")) +
+  ylab("Diversity Value\n") + xlab("\nWeeks Incubated") +
+  ggtitle("Richness and Evenness for Plate Samples\n") + theme(strip.placement = "left") +
+  scale_color_manual(values = viridis(5)[4:2])
+
+
+# Save the plot.
+save_plot("../figures/Plating_RichnessEvenness_AllWeeks.pdf", plot = alpha_figure_allweeks, base_width = 11, base_height = 6, scale = 1.75)
+
+```
+
+# 1.4) Investigating the effects of week 5 onward for diversity metrics.
+
+```{r 1.4-week5on-richnessandevenness, fig.height = 6, fig.width = 8}
+
+# We aren't considering the 10e-6 dilution here, remove it.
+alpha_table_melt.week5on <- filter(alpha_table_melt2to4, WeeksIncubated %in% c(5,6,7,8))
+
+# Make the plot.
+alpha_figure_week5on <- ggplot(alpha_table_melt.week5on, aes(x = WeeksIncubated, y = DiversityValue)) +
+  geom_boxplot(aes(color = Dilution)) +
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  facet_grid(Community+DiversityMetric~Dilution, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black"),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+        text=element_text(size=24)) + theme(panel.spacing = unit(2, "lines")) +
+  ylab("Diversity Value\n") + xlab("\nWeeks Incubated") +
+  ggtitle("Richness and Evenness for Plate Samples\nWeek 5 On\n") + theme(strip.placement = "left") +
+  scale_color_manual(values = viridis(5)[4:2])
+
+# View the figure.
+alpha_figure_week5on
+
+# Save the plot.
+save_plot("../figures/Plating_RichnessEvenness_Week5On.pdf", plot = alpha_figure_week5on, base_width = 6, base_height = 6, scale = 1.75)
+
+```
+
+
+
+## 2) Investigating isolates.
+
+In this set of experiments, one starting consortium (10^-4 PART C, aka C2/MSC-1) was 'dissected' into individual
+isolates. This occurred in two rounds of isolation. In the first round, a starting community was plated for isolation
+on two types of agar plate media (soil extract + 100 ppm chitin, and R2A + agar). In the second round, the starting
+community was plated on the same two media types as above, but also chitin only (i.e. 100 ppm chitin with no soil extract),
+diluted soil extract (10% of normal) + chitin, and soil extract with no chitin. The goal was to see if different types of
+isogenic isolates are 'teased out' by different media types.
+
+# 2.1) Importing biom/tree data for isolates:
+
+```{r 2.1-import-isolate-data, include=FALSE, eval=TRUE, message = FALSE}
+
+# Load the isolate data:
+unrar.isolate <- import_biom("../data/isolates_2.biom", "../data/isolates_2.tree")
+metadata.isolate <- import_qiime_sample_data("../data/isolates_metadata.txt")
+metadata.isolate$X = NULL # Loading the object gives an extra dummy column of the rownames we can excise.
+
+# Merge the raw data with the metadata.
+unrar.isolate <- merge_phyloseq(unrar.isolate, metadata.isolate)
+
+# Create factor levels for the Media type. Note: 'Original' represents the starting community. 
+sample_data(unrar.isolate)$Media <- factor(sample_data(unrar.isolate)$Media, levels = c("Original",
+                                                                                        "R2A_NoChitin_Round1",
+                                                                                        "R2A_NoChitin_Round2",
+                                                                                        "Soil_Chitin_Round1",
+                                                                                        "Soil_Chitin_Round2",
+                                                                                        "NoSoil_Chitin",
+                                                                                        "10%Soil_Chitin",
+                                                                                        "Soil_NoChitin"))
+
+# Rarefy to even depth. Note: because we aren't considered with aspects like diversity measurements, we primarily
+# are concerned with the taxnomic breakdown of these isolates, we are going to rarefy to a level that retains all of
+# the isolates, which is equivalent to the reads presents in the sample with the lowest reads (2278).
+rar.isolate <- rarefy_even_depth(unrar.isolate, rngseed = 711, sample.size = 2278)
+colnames(tax_table(rar.isolate)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax_table(rar.isolate)[,] <- gsub("^.__", "", tax_table(rar.isolate)[,])
+
+# Make a separate phyloseq object that only contains samples from the original round of isolation.
+rar.isolate.round1 <- subset_samples(rar.isolate, Media %in% c("R2A_NoChitin_Round1", "Soil_Chitin_Round1"))
+
+# Now we have a phyloseq object representing all isolate data ('rar.isolate') and one with just the
+# original round of isolates ('rar.isolate.round1').
+
+```
+
+# 2.2) Top taxa counts.
+
+We're interested in the proportion of the dataset devoted to the top 'n' OTUs, to see how isogenic
+the cultures are.
+
+```{r 2.2-taxa-counts, eval = T}
+
+# How many non-zero OTUs are there?
+rar.isolate %>% filter_taxa(function(x){max(x) > 0 }, prune = T) %>% tax_glom("Genus") %>% ntaxa # 178 non-zero OTUs.
+
+rar.isolate %>% filter_taxa(function(x){max(x) > 100 }, prune = T) %>% tax_glom("Genus") %>% ntaxa # 15 OTUs with >100 counts.
+
+# Making a function to calculate the individual OTUs that constitute the majority of the readcounts,
+# along with the percentage of total readcounts they make up.
+get_top_OTUs <- function(phy, n = 10){
+  tax <- data.frame(tax_table(phy))
+  
+  tax_otu.counts <- cbind(tax, taxa_sums(phy))
+  colnames(tax_otu.counts)[8] <- "OTU.counts"
+  
+  # Sort by decreasing total OTU counts.
+  tax_otu.counts <- tax_otu.counts[order(tax_otu.counts$OTU.counts, decreasing = TRUE),]
+  
+  top_OTUs <- data.frame("Phylum" = tax_otu.counts$Phylum[0:n], "Class" = tax_otu.counts$Class[0:n],
+                         "Genus" = tax_otu.counts$Genus[0:n], "OTU.counts" = tax_otu.counts$OTU.counts[0:n])
+  rownames(top_OTUs) <- rownames(tax_otu.counts)[0:n]
+  
+  # Get the percentage of total readcounts.
+  top_OTUs$Percent.of.TotalReadcounts <- round(as.numeric(as.character(top_OTUs$OTU.counts))/sum(taxa_sums(phy)), 4) * 100
+
+  return(top_OTUs)
+}
+
+top_isolate_OTUs <- get_top_OTUs(rar.isolate, n = 10)
+# top_isolate_OTUs # So these top 20 OTUs are the vast majority of readcounts,
+# everything else is below 0.05% relative abundance of the full dataset.
+top10taxa <- paste(top_isolate_OTUs$Phylum, top_isolate_OTUs$Genus, rownames(top_isolate_OTUs), sep = ".")
+
+top_isolate_round1_OTUs <- get_top_OTUs(rar.isolate.round1, n = 10)
+# top_isolate_round1_OTUs # The top 10 OTUs are again the vast majority of readcounts, every other OTU is <0.04% of readcounts.
+top10taxa.round1 <- paste(top_isolate_round1_OTUs$Phylum, top_isolate_round1_OTUs$Genus, rownames(top_isolate_round1_OTUs), sep = ".")
+
+```
+
+# 2.3) Barplot for the top 10 OTUs for both rounds of isolation.
+
+The goal of this code block is to get a relative abundance plot of all isolate communities,
+at the OTU level, to see how isogenic they are.
+
+```{r 2.3-barplot-top10isolateOTUs, eval = T, fig.width = 9, fig.height = 3}
+
+######################################################################
+### Make a barplot for the top 10 OTUs (+ other) for all isolates. ###
+######################################################################
+
+# Removing the original parent community from this analysis.
+rar.isolate.noparent <- subset_samples(rar.isolate, Media != "Original")
+
+# Relabel species so everything NOT in the top 20 is labeled as 'Other',
+# so we don't have a ton of OTUs to account for.
+for(i in 1:nrow(tax_table(rar.isolate.noparent))){
+  tax_table(rar.isolate.noparent)[i, 7] <- "Other"
+  if(rownames(tax_table(rar.isolate.noparent))[i] %in% rownames(top_isolate_OTUs)){
+    tax_table(rar.isolate.noparent)[i, 7] <- paste(tax_table(rar.isolate.noparent)[i, 2], 
+                                           # tax_table(rar.isolate.noparent)[i, 3],
+                                          tax_table(rar.isolate.noparent)[i, 6],
+                                          rownames(tax_table(rar.isolate.noparent))[i], sep = ".")
+  }
+}
+
+
+# Melt the phyloseq object to make graphing easier.
+df.isolate.top10 <- psmelt(rar.isolate.noparent)
+# View(df.isolate.top20)
+
+# Make a 21-member palette for the isolate plot.
+palette1to10 <- c(brewer.pal(10, "Spectral"))
+# palette11to20 <- lighten(palette1to10, amount = 0.40, method = "relative")
+# palette21 <- c(palette1to10, palette11to20, "gray34")
+
+# Make 'Species' a factor level.
+df.isolate.top10$Species <- factor(df.isolate.top10$Species, levels = c(top10taxa, "Other"))
+
+# Graph the top 20 OTUs.
+isolate_top10_plot <- ggplot(data=df.isolate.top10,aes(x=Replicate,y=Abundance,fill=Species)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_grid(~Media, space = "free_x", scales = "free_x") +
+  scale_fill_manual(values = c(palette1to10, "gray34")) +
+  theme(axis.text.x=element_blank(), axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=18,face="bold"),text=element_text(size=12), axis.title.x = element_blank()) +
+  ggtitle("Isolates Top 10 OTUs Relative Abundance") + theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5)) +
+  guides(fill=guide_legend(title="Phylum/Genus/OTU", ncol = 1))
+
+isolate_top10_plot
+
+ggsave("../figures/IsolatesRelativeAbundance_BothRounds.pdf", plot = isolate_top10_plot, height = 8, width = 20)
+
+```
+
+# 2.4) Barplot for the top 10 OTUs for the original round of isolation.
+
+```{r 2.4-barplot-topisolateOTUs, eval = T, fig.width = 9, fig.height = 3}
+
+########################################################################################
+### Make a barplot for the top 10 OTUs (+ other) for the original round of isolates. ###
+########################################################################################
+
+# Relabel species so everything NOT in the top 10 is labeled as 'Other'.
+for(i in 1:nrow(tax_table(rar.isolate.round1))){
+  tax_table(rar.isolate.round1)[i, 7] <- "Other"
+  if(rownames(tax_table(rar.isolate.round1))[i] %in% rownames(top_isolate_round1_OTUs)){
+    tax_table(rar.isolate.round1)[i, 7] <- paste(tax_table(rar.isolate.round1)[i, 2], 
+                                           # tax_table(rar.isolate.round1)[i, 3],
+                                          tax_table(rar.isolate.round1)[i, 6],
+                                          rownames(tax_table(rar.isolate.round1))[i], sep = ".")
+  }
+}
+
+df.isolateround1.top10 <- psmelt(rar.isolate.round1)
+df.isolateround1.top10$Species <- factor(df.isolateround1.top10$Species, levels = c(top10taxa.round1, "Other"))
+df.isolateround1.top10$Media <- revalue(df.isolateround1.top10$Media, c("Soil_Chitin_Round1" = "Chitin",
+                                                                        "R2A_NoChitin_Round1" = "R2A"))
+
+palette1to10 <- c(brewer.pal(10, "Spectral"))
+
+isolate.round1_top10_plot <- ggplot(data=df.isolateround1.top10,aes(x=Media,y=Abundance,fill=Species)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_grid(~Replicate, space = "free_x", scales = "free_x") +
+  scale_fill_manual(values = c(palette1to10, "gray34")) +
+  theme(axis.title.x=element_blank(), axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=18,face="bold"),text=element_text(size=24), axis.text.x = element_text(size = 14, angle = 45, hjust = 1)) +
+  ggtitle("Isolates - Round 1 - Top 10 OTUs Relative Abundance") + theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5)) +
+  guides(fill=guide_legend(title="Phylum/Genus/OTU", ncol = 1))
+
+isolate.round1_top10_plot
+
+ggsave("../figures/IsolatesRelativeAbundance_Round1.pdf", plot = isolate.round1_top10_plot, height = 8, width = 20)
+
+```
+
+
+# 2.5) Co-culture ODs - early timepoint.
+
+In one set of experiments, individual isolates were grown in liquid M9 media with n-acetylglucosamine (NAG) as a carbon substrate. Isolates were either
+grown singly, or in co-cultures, in the latter case to examine their interactive effects (i.e. whether they exerted competitive or synergistic effects
+on one another). Growth was measured using optical density of the culture, at multiple timepoints including 'early' and 'late'. In this code block,
+we will graph the early timepoint.
+
+```{r 2.5-cocultureplot-earlytimepoint, eval = T, fig.width = 6, fig.height = 3}
+
+# Import data.
+od.data <- read.table("../data/coculture_ods.txt", sep = "\t", header = T)
+
+# Add factor levels.
+od.data$Combination <- factor(od.data$Combination, levels = c("Dyado/Rhodo", "Strep/Rhodo", "Ensifer/Rhodo",
+                                                              "Vario/Rhodo", "Rhizo/Rhodo", "Dyado/Strep",
+                                                              "Dyado/Rhizo", "Strep/Ensifer", "Strep/Vario",
+                                                              "Strep/Rhizo", "Ensifer/Rhizo", "Vario/Rhizo"))
+od.data$Member <- factor(od.data$Member, levels = c("First", "Second", "Both")) %>% revalue(., c("First" = "OD600 of First Species Monoculture",
+                                                                                                 "Second" = "OD600 of Second Species Monoculture",
+                                                                                                 "Both" = "OD600 of Co-Culture"))
+
+# Make subsets for early and late timepoints, these will be graphed separately.
+od.early <- filter(od.data, Timepoint == "Early")
+od.late <- filter(od.data, Timepoint == "Late")
+
+# Summarize the dataframe with average values for each culture/timepoint as well as standard deviations.
+# This is a function to generate those summary statistics.
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- plyr::rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+# Run the function. We will need the standard deviation to graph the error bars.
+df.early <- data_summary(data = od.early, varname="OD", 
+                    groupnames=c("Community", "Member", "Combination"))
+df.late <- data_summary(data = od.late, varname = "OD",
+                        groupnames = c("Community", "Member", "Combination"))
+
+# Graph the early timepoint.
+early.plot <- ggplot(data = df.early, aes(x = Combination, y = OD, color = Member, shape = Member)) +
+  scale_color_manual(values = c("blue", "orange", "gray75")) +
+  scale_shape_manual(values = c(15, 16, 17)) +
+  geom_errorbar(aes(ymin=OD-sd, ymax=OD+sd), width=.2,
+                 position=position_dodge(0.01), color = "black") +
+  geom_point(size = 5) + ggtitle("Early Exponential Phase\n") + 
+  xlab("Co-Culture") + ylab("OD600\n") + ylim(0, 0.6) +
+  theme(plot.title = element_text(size = 24, face= "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 16, face = "bold", angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 16, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        legend.title = element_blank(), legend.text = element_text(size = 20))
+
+# View the plot.
+early.plot
+
+# Save the plot.
+save_plot("../figures/Coculture_Early.pdf", plot = early.plot, base_height = 3, base_width = 6, scale = 2)
+
+```
+
+# 2.6) Graph the co-culture plot for the late timepoint.
+
+```{r 2.6-cocultureplot-latetimepoint, eval = T, fig.width = 6, fig.height = 3}
+
+# Graph the early timepoint.
+late.plot <- ggplot(data = df.late, aes(x = Combination, y = OD, color = Member, shape = Member)) +
+  scale_color_manual(values = c("blue", "orange", "gray75")) +
+  scale_shape_manual(values = c(15, 16, 17)) +
+  geom_errorbar(aes(ymin=OD-sd, ymax=OD+sd), width=.2,
+                 position=position_dodge(0.01), color = "black") +
+  geom_point(size = 5) + ggtitle("Late Stationary Phase\n") + 
+  xlab("Co-Culture") + ylab("OD600\n") + ylim(0, 1.4) +
+  theme(plot.title = element_text(size = 24, face= "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 16, face = "bold", angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 16, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        legend.title = element_blank(), legend.text = element_text(size = 20))
+
+# View the plot.
+late.plot
+
+# Save the plot.
+save_plot("../figures/Coculture_Late.pdf", plot = late.plot, base_height = 3, base_width = 6, scale = 2)
+
+```
+
+# 2.7) Calculate whether the co-culture is significantly higher for OD than either of the corresponding monocultures.
+
+If co-cultures have significantly greater OD values than the nearest monoculture (p < 0.05, increase > 15%), then
+we will indicate as such using an asterisk on the plots in 2.5 and 2.6.
+
+```{r 2.7-coculturevsmonoculture-ttest, eval = T}
+
+# Initialize a dataframe for these results. Make a separate one for early and late timepoints.
+coculture.early.sig.results <- data.frame(Combination = character(), FirstMonocultureAvg = numeric(),
+                          SecondMonocultureAvg = numeric(), CoCultureAvg = numeric, t.test.p.value.first = numeric(),
+                          t.test.p.value.second = numeric(), pct.increase.first = numeric(), pct.increase.second = numeric())
+
+coculture.late.sig.results <- data.frame(Combination = character(), FirstMonocultureAvg = numeric(),
+                          SecondMonocultureAvg = numeric(), CoCultureAvg = numeric, t.test.p.value.first = numeric(),
+                          t.test.p.value.second = numeric(), pct.increase.first = numeric(), pct.increase.second = numeric())
+
+# Make a list of the unique combinations.
+combos <- unique(df.early$Combination)
+
+
+
+# Iterate through all the unique co-cultures and get t-test results for all of them.
+coculture_sigs <- function(df = od.early, sig.results = coculture.early.sig.results, coms = combos){
+  for(i in 1:length(coms)){
+  
+    # Make a subset of the overall distance object with just the community actively being considered.
+    com <- coms[i]
+    sub1 <- subset(df, Combination == com)
+    firstsub <- subset(sub1, Member != "OD600 of Second Species Monoculture")
+    secondsub <- subset(sub1, Member != "OD600 of First Species Monoculture")
+  
+    # Perform a T-test on this comparison. This will return the average value for each factor,
+    # as well as the p-value. We will add all three to the dataframe.
+    first.t.test <- t.test(OD~Member, data = firstsub)
+    second.t.test <- t.test(OD~Member, data = secondsub)
+    
+    first.p.value <- first.t.test$p.value
+    # print("First P-Value")
+    # print(first.p.value)
+    second.p.value <- second.t.test$p.value
+    # print("Second P-Value")
+    # print(second.p.value)
+    
+    first.mean <- first.t.test$estimate[1]
+    second.mean <- second.t.test$estimate[1]
+    both.mean <- first.t.test$estimate[2]
+    
+    first.increase <- (both.mean / first.mean) - 1
+    second.increase <- (both.mean / second.mean) - 1
+  
+    # Make a new dataframe with all of these values, and bind it to the original 'sig.results' dataframe.
+    y <- data.frame(Combination = com, FirstMonocultureAvg = first.mean, SecondMonocultureAvg = second.mean,
+                    CoCultureAvg = both.mean, t.test.p.value.first = first.p.value, t.test.p.value.second = second.p.value,
+                    pct.increase.first = first.increase, pct.increase.second = second.increase)
+    sig.results <- rbind(sig.results, y)
+  }
+  
+  rownames(sig.results) <- NULL
+  options(scipen = 999)
+  sig.results[,2:8] <- lapply(sig.results[,2:8], function(x) round(x, digits = 4)) # Round to the nearest 4 digits for readability.
+
+  
+  return(sig.results)
+}
+
+early.sigs <- coculture_sigs(df = od.early, sig.results = coculture.early.sig.results, coms = combos)
+late.sigs <- coculture_sigs(df = od.late, sig.results = coculture.late.sig.results, coms = combos)
+
+# The cutoff we were using was anything with a p-value less than 0.002, and an increase greater than 15% for the co-culture
+# relative to the individual monocultures. Note that we're doing this relative to whichever monoculture is closer to the co-culture
+# with respect to OD values, hence the below loops for subsetting.
+
+early.keep <- vector()
+for(i in 1:nrow(early.sigs)){
+  if(early.sigs$FirstMonocultureAvg[i] > early.sigs$SecondMonocultureAvg[i]){
+    if(early.sigs$t.test.p.value.first[i] < 0.05 & early.sigs$pct.increase.first[i] > 0.15){
+      early.keep <- append(early.keep, i)
+    }
+  }
+  if(early.sigs$FirstMonocultureAvg[i] < early.sigs$SecondMonocultureAvg[i]){
+    if(early.sigs$t.test.p.value.second[i] < 0.05 & early.sigs$pct.increase.second[i] > 0.15){
+      early.keep <- append(early.keep, i)
+    }
+  }
+}
+
+late.keep <- vector()
+for(i in 1:nrow(late.sigs)){
+  if(late.sigs$FirstMonocultureAvg[i] > late.sigs$SecondMonocultureAvg[i]){
+    if(late.sigs$t.test.p.value.first[i] < 0.05 & late.sigs$pct.increase.first[i] > 0.15){
+      late.keep <- append(late.keep, i)
+    }
+  }
+  if(late.sigs$FirstMonocultureAvg[i] < late.sigs$SecondMonocultureAvg[i]){
+    if(late.sigs$t.test.p.value.second[i] < 0.05 & late.sigs$pct.increase.second[i] > 0.15){
+      late.keep <- append(late.keep, i)
+    }
+  }
+}
+
+
+early.sigs.cutoff <- early.sigs[early.keep,] # We have 6 samples that passed the threshold for the early timepoint.
+late.sigs.cutoff <- late.sigs[late.keep,] # Nothing passed muster for the late timepoint.
+
+early.sigs.cutoff
+
+```
+
+
+## 3) Investigating the trends for reconstituting different microbial consortia from glycerol or lyophilized stocks.
+
+In this set of experiments, there were seven distinct reduced-complexity microbial consortia that were generated
+
+# 3.1) Importing the reconstituted glycerol/lyophilized biom/tree data.
+
+```{r 3.1-import-recon-data, include = FALSE, eval = TRUE, echo = FALSE, message = FALSE}
+
+# Import the data for this dataset.
+unrar.recon <- import_biom("../data/recon.biom", "../data/recon.tree")
+
+metadata.recon <- import_qiime_sample_data("../data/recon_metadata.txt")
+metadata.recon$X <- NULL
+
+# Revalue the communities to be the 'shorthand' names used in the paper proper.
+metadata.recon$Community <- revalue(metadata.recon$Community, c("10^-2.FULL.C" = "C1", "10^-3.FULL.D" = "D1",
+                                                                "10^-3.PART.A" = "A1", "10^-3.PART.B" = "B1",
+                                                                "10^-3.PART.F" = "F1", "10^-4.FULL.D" = "D2",
+                                                                "10^-4.PART.C" = "C2")) %>%
+  factor(., levels = c("C1", "D1", "A1", "B1", "F1", "D2", "C2"))
+
+
+# Merge the raw data and metadata into one phyloseq object.
+unrar.recon <- merge_phyloseq(unrar.recon, metadata.recon)
+
+colnames(tax_table(unrar.recon)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax_table(unrar.recon) <- gsub("^.__", "", tax_table(unrar.recon))
+
+# Rarefy the dataset.
+recon.rardepth <- 5260 # This is the value for the 2nd lowest sample; it will remove one C2 generation II sample, but
+# as that has very low readcounts (1650), it represents a low-quality sample and should be removed regardless.
+
+# Make one rarefied phyloseq object containing ALL samples (including C2 generation II) in this dataset.
+rar.recon <- rarefy_even_depth(unrar.recon, rngseed = 711, sample.size = recon.rardepth)
+# rar.recon # <- This generates a phyloseq object consisting of 185 taxa and 69 samples.
+
+# Including the C2 generation II samples in this analysis will bias the rarefaction and Bray-Curtis distances, so we
+# will create a separate phyloseq object without them for the corresponding C2-less analyses.
+rar.recon.noc2 <- rarefy_even_depth(subset_samples(unrar.recon, StorageMethod != "GenerationII"), rngseed = 711, sample.size = recon.rardepth)
+# rar.recon.noc2 # <- This generates a phyloseq object consisting of 179 taxa and 67 samples.
+
+```
+
+
+# 3.2) Investigating trends for Bray-Curtis distances between the original community and its
+# reconstituted communities (glycerol vs. lyophilized).
+
+The goal of this code block is to generate a boxplot representing the distances from original <-> glycerol
+or original <-> lyophilized (i.e. reconstituted) samples, for each of the seven unique communities. We will be
+using Bray-Curtis as our distance metric here.
+
+```{r 3.2-originalvsreconstituted-braycurtisboxplots, eval = TRUE, fig.height = 3, fig.width = 5}
+
+# This uses the 'rar.recon.noc2' phyloseq object generated in the 2.1 code block. We specifically want
+# to exclude C2 generation II from this set of analyses, as it will bias the B-C distance object values, and
+# we aren't considering those specific samples here in any event.
+
+# Get the metadata for this object.
+noc2.metadata <- data.frame(sample_data(rar.recon.noc2))
+
+# Generate a dataframe showing the Bray-Curtis distances between all pairs of samples.
+df.recon.bray <- rar.recon.noc2 %>% otu_table %>% as("matrix") %>% t %>%
+   vegdist(method="bray", binary=T, diag=F, na.rm = FALSE) %>%
+   as.matrix %>% reshape2::melt(varnames = c("one", "two"))
+
+
+# Edit the above dataframe to include the metadata, which we will use for faceting when making a plot.
+for(i in 1:nrow(df.recon.bray)){
+  one <- as.character(df.recon.bray$one[i])
+  two <- as.character(df.recon.bray$two[i])
+  
+  df.recon.bray$StorageMethod1[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == one, 1]))
+  df.recon.bray$Community1[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == one, 2]))
+  df.recon.bray$IsolationRep1[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == one, 3]))
+  
+  df.recon.bray$Comparison[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == two, 1]))
+  df.recon.bray$Community2[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == two, 2]))
+  df.recon.bray$IsolationRep2[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == two, 3]))
+}
+
+# Subset this so you only get the comparisons between identical communities. For the purpose of this dataset,
+# The goal of this is to look at the original parent starting consortium and its distance to the reconstituted
+# 'daughter' communities for glycerol vs. lyophilized; we don't need to compare parents to any other communities.
+df.recon.bray <- df.recon.bray[df.recon.bray$Community1 == df.recon.bray$Community2,]
+df.recon.bray <- df.recon.bray[(df.recon.bray$StorageMethod1 == "Original" & df.recon.bray$Comparison != "Original"),]
+
+# Get rid of self-comparisons.
+df.recon.bray <- df.recon.bray[df.recon.bray$value != 0,]
+
+# Add in a detailed description for comparison, for graphing purposes; then make it a factor.,
+df.recon.bray$Comparison <- paste(df.recon.bray$StorageMethod1, "<->", df.recon.bray$Comparison, sep = " ")
+df.recon.bray$Comparison <- factor(df.recon.bray$Comparison, levels = c("Original <-> Glycerol",
+                                   "Original <-> Lyophilized"))
+df.recon.bray$Community1 <- factor(df.recon.bray$Community1, levels = levels(metadata.recon$Community))
+
+# Generate a boxplot for these differences, faceted by community.
+brayplot <- ggplot(data = df.recon.bray, aes(Comparison, value, fill = Comparison)) + geom_boxplot() +
+  facet_grid(~Community1, scales = "free", switch = "y", space = "free_x") +
+  labs(x = "\nCommunity", y = "Bray-Curtis Distance\n", title = "Distance from Original") +
+  theme(axis.text.x=element_text(size=8,color="black", angle=45, hjust = 1),
+        axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=12),
+        plot.title = element_text(size = 20, face = "bold", hjust = 0.5)) +
+  ggtitle("Bray-Curtis Distance for Original vs. Reconstituted Samples\n")
+
+# View the plot.
+brayplot
+
+save_plot("../figures/ReconstitutedBoxplots.pdf", plot = brayplot, base_width = 7, base_height = 3, scale = 1.75)
+
+
+```
+
+# 3.3) Confirming significantly different values for B-C original <-> lyophilized samples.
+
+In the previous code block, we examined how the original parent communities differed between their respective
+reconstitutions from glycerol or lyophilized stocks. Now we want to determine which, if any, of the glycerol vs.
+lyophilized differences are significant. We want to do that via two methods: a simple t-test, as well as a Wilcoxon
+rank-sum test, which is used when you cannot assume the values have a normal distribution.
+
+```{r 3.3-ttest-wilcoxtest-significantreconstituteddifferences, eval = T, warning = FALSE}
+
+#####################################################################################################################
+### Generate the significance tests for original <-> glycerol vs. original <-> lyophilized Bray-Curtis distances. ###
+#####################################################################################################################
+
+# Generate a list of the unique consortia communities.
+coms <- unique(df.recon.bray$Community1)
+
+options(scipen = 999) # Turn off scientific notation if possible.
+
+# Initialize a dataframe for the significance results. We'll have the information on which community
+# is being analyzed, the average value for the original <-> glycerol distances, the average value for the
+# original <-> lyophilized distances, the significance value for the t-test comparison, and the 
+# significance value for the Wilcox test comparison.
+sig.results <- data.frame(Community = character(), GlycerolAvg = numeric(),
+                          LyophilizedAvg = numeric(), t.test.p.value = numeric(),
+                          wilcox.test.p.value = numeric())
+
+
+# Start this comparison with the entire dataset.
+x <- t.test(value~Comparison, data = df.recon.bray)
+y <- wilcox.test(value~Comparison, data = df.recon.bray)
+
+# Calculate and add these values to the above dataframe.
+overall.results <- data.frame(Community = "Overall", GlycerolAvg = x$estimate[1], LyophilizedAvg = x$estimate[2],
+                              t.test.p.value = as.numeric(x$p.value), wilcox.test.p.value = as.numeric(y$p.value))
+sig.results <- rbind(sig.results, overall.results)
+
+# Iterate through all the unique communities and see if the original <-> reconstituted differences
+# are significantly different for each community, based on the method of reconstitution.
+for(i in 1:length(coms)){
+  
+  # Make a subset of the overall distance object with just the community actively being considered.
+  com <- coms[i]
+  sub1 <- subset(df.recon.bray, Community1 == com)
+  
+  # Perform a T-test on this comparison. This will return the average value for each factor,
+  # as well as the p-value. We will add all three to the dataframe.
+  x <- t.test(value~Comparison, data = sub1)
+  t.p <- x$p.value
+  glymean <- x$estimate[1]
+  lymean <- x$estimate[2]
+  
+  # Perform a Wilcoxon rank-sum test on this comparison.
+  w.p <- wilcox.test(value~Comparison, data = sub1)$p.value
+  
+  # Make a new dataframe with all of these values, and bind it to the original 'sig.results' dataframe.
+  y <- data.frame(Community = com, GlycerolAvg = glymean, LyophilizedAvg = lymean, t.test.p.value = t.p, wilcox.test.p.value = w.p)
+  sig.results <- rbind(sig.results, y)
+}
+
+rownames(sig.results) <- NULL
+sig.results[,2:5] <- lapply(sig.results[,2:5], function(x) round(x, digits = 3)) # Round to the nearest 3 digits for readability.
+
+sig.results
+
+## CONCLUSION => the significantly different communities are: overall,
+## C1/10^-2 Full C (t-test only), A1/10^-3 Part A, F1/10^-3 Part F, and D2/10^-4 Full D.
+
+# Write this table of significances as a txt object.
+write.table(sig.results, "../figures/ReconstitutedSigDifferences_TtestandWilcoxTest.txt", sep = "\t", row.names = FALSE)
+
+```
+
+# 3.4) Generating a PCoA object for the reconstituted samples - original vs. glycerol- and lyoophilized-reconstituted. No C2 samples.
+
+In this code block, we want to create an ordination using Bray-Curtis distances, representing all of our samples 
+colored by community and shaped by their storage method (i.e. glycerol vs. lyophilized vs. original parent community).
+The regenerated C2/MSC-1 community will not be included in this specific ordination.
+
+```{r 3.4-pcoa-originalvsglycerol, eval = T, fig.height = 4, fig.width = 5}
+
+# Make your distance object using Bray-Curtis distance.
+recon.bray.noc2 <- ordinate(rar.recon.noc2, method = "PCoA", distance = "bray")
+
+# Generate the PCoA objects.
+brayplot.pcoa.noc2 <- plot_ordination(rar.recon.noc2, recon.bray.noc2, color="Community",
+                                      shape="StorageMethod", title = "PCoA of Bray-Curtis Distances for Reconstitution") + scale_color_brewer(palette="Set2") + geom_point(size = 5) + theme(plot.title = element_text(size = 20, hjust = 0.5, face = "bold"))
+
+# View the plot.
+brayplot.pcoa.noc2
+
+# Save the plot object.
+save_plot("../figures/ReconstitutedPCoA_AllReconButC2.pdf", plot = brayplot.pcoa.noc2, base_width = 5, base_height = 3, scale = 1.75)
+
+```
+
+# 3.5) Generating a PCoA object for the reconstituted samples - original vs. glycerol-reconstituted (no lyophilized samples) only.
+
+In this code block, we're making a specific ordination only looking at the original parent to reconstituted glycerol stocks
+to look at the effects of this storage method in higher resolution. Again, C2/MSC-1 is not included in this analysis.
+
+```{r 3.5-pcoa-originalvsglycerol, eval = T, fig.height = 4, fig.width = 5}
+
+# Making a subset of the starting phyloseq object without the lyophilized samples.
+rar.recon.noc2.noly <- subset_samples(rar.recon.noc2, StorageMethod != "Lyophilized")
+
+# Make your distance object using Bray-Curtis distance.
+recon.bray.noly <- ordinate(rar.recon.noc2.noly, method = "PCoA", distance = "bray")
+
+# Generate the PCoA objects.
+brayplot.pcoa.noly <- plot_ordination(rar.recon.noc2.noly, recon.bray.noly,
+                                      color="Community", shape="StorageMethod",
+                                      title = "PCoA of Bray-Curtis Distances for Reconstitution") +
+  scale_color_brewer(palette="Set2") + geom_point(size = 5) +
+  theme(plot.title = element_text(size = 20, hjust = 0.5, face = "bold"))
+
+# View the plot.
+brayplot.pcoa.noly
+
+# Save the plot.
+save_plot("../figures/ReconstitutedPCoA_OriginalvsGly.pdf", plot = brayplot.pcoa.noly, base_width = 5, base_height = 3, scale = 1.75)
+
+```
+
+# 3.6) Generating a PCoA object for ALL samples in the reconstituted vs. original dataset, including C2 generation II.
+
+In this code block, we're making a comprehensive ordination to look at all samples in the reconstituted dataset, with
+the goal of seeing how C2/MSC-1 generation II compares to other samples, especially if it's closer to any other samples
+than it is to C2 generation I or the C2 parent community.
+
+```{r 3.6-pcoa-reconstitutedallsamples, eval = T, fig.height = 4, fig.width = 5}
+
+# We need to make a specific modification to the metadata for this analysis, where we
+# add in C2 generation II as a separate community to generation I.
+sample_data(rar.recon)$Community <- as.character(sample_data(rar.recon)$Community)
+sample_data(rar.recon)[sample_data(rar.recon)$StorageMethod == "GenerationII",
+                       colnames(sample_data(rar.recon)) == "Community"] <- "C2.GenerationII"
+sample_data(rar.recon)[sample_data(rar.recon)$StorageMethod != "GenerationII" & sample_data(rar.recon)$Community == "C2",
+                       colnames(sample_data(rar.recon)) == "Community"] <- "C2.GenerationI"
+
+# Make 'Community' and 'StorageMethod' factor levels.
+sample_data(rar.recon)$Community <- factor(sample_data(rar.recon)$Community,
+                                           levels = c("C1", "D1", "A1", "B1", "F1", "D2", 
+                                                      "C2.GenerationI", "C2.GenerationII"))
+sample_data(rar.recon)$StorageMethod <- factor(sample_data(rar.recon)$StorageMethod,
+                                               levels = c("Original", "Glycerol", "Lyophilized", "GenerationII"))
+
+# Make your distance objects, including Bray and Weighted Unifrac.
+recon.bray.all <- ordinate(rar.recon, method = "PCoA", distance = "bray")
+
+# Generate the plot object.
+brayplot.pcoa.all <- plot_ordination(rar.recon, recon.bray.all, color="Community", shape="StorageMethod",
+                                title = "PCoA of Bray-Curtis Distances\nfor All Reconstituted Samples\n") +
+  geom_point(size = 5) + scale_color_brewer(palette="Set2") +
+  scale_shape_manual(values = c(16, 17, 15, 18)) + theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+
+# View the plot.
+brayplot.pcoa.all
+
+# Save the plot object.
+save_plot("../figures/ReconstitutedPCoA_AllSamples.pdf", plot = brayplot.pcoa.all, base_width = 5, base_height = 4, scale = 1.85)
+
+
+```
+
+# 3.7) Comparing distances between original and original, original and glycerol or lyophilized,
+# and original and other parent communities.
+
+The point of this code block is to compare the (Bray-Curtis) distances within reconstituted community replicates
+to one another, to its respective parent community, then to OTHER parent communities, with the end goal being
+to see that the reconstituted community is closer to its parent communities than it is to any of the other
+parent communities.
+
+```{r 3.7-reconstituted-to-parent-communities, fig.height = 11, fig.width = 7.5}
+
+# In this specific block we aren't considering C2 generation II.
+
+# Get the metadata for the noc2 phyloseq object.
+noc2.metadata <- data.frame(sample_data(rar.recon.noc2))
+
+# Generate a dataframe showing the Bray-Curtis distances between pairs of samples.
+df.recon.bray <- rar.recon.noc2 %>% otu_table %>% as("matrix") %>% t %>%
+   vegdist(method="bray", binary=T, diag=F, na.rm = FALSE) %>%
+   as.matrix %>% reshape2::melt(varnames = c("one", "two"))
+
+
+# Edit this dataframe to include the metadata.
+for(i in 1:nrow(df.recon.bray)){
+  one <- as.character(df.recon.bray$one[i])
+  two <- as.character(df.recon.bray$two[i])
+  
+  df.recon.bray$StorageMethod1[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == one, 1]))
+  df.recon.bray$Community1[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == one, 2]))
+  df.recon.bray$IsolationRep1[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == one, 3]))
+  
+  df.recon.bray$Comparison[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == two, 1]))
+  df.recon.bray$Community2[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == two, 2]))
+  df.recon.bray$IsolationRep2[i] <- (as.character(noc2.metadata[rownames(noc2.metadata) == two, 3]))
+}
+
+
+
+df.recon.bray <- df.recon.bray[df.recon.bray$value != 0.0000000,] # Get rid of self-self comparisons.
+colnames(df.recon.bray)[colnames(df.recon.bray) == "Community2"] <- "Community"
+coms <- unique(df.recon.bray$Community1)
+df.recon.bray$Community <- factor(df.recon.bray$Community, levels = levels(noc2.metadata$Community))
+
+# Make a function to generate a plot for the original vs. reconstituted samples. We're doing separate plots
+# for either of the storage methods, so as to more easily separate the effects by method.
+bray.boxplot <- function(df.recon.bray, storage = "Glycerol", notstorage = "Lyophilized", com = "C2"){
+  sub1 <- subset(df.recon.bray, Community1 == com & StorageMethod1 == storage)
+  sub2 <- subset(sub1, Comparison == "Original" | Community == com)
+  sub3 <- subset(sub2, Comparison != notstorage)
+  
+  for(i in 1:nrow(sub3)){
+    if(sub3$Community[i] != com){
+      sub3$Category[i] <- "Other Parent Communities"
+    }
+    if(sub3$Community[i] == com & sub3$Comparison[i] == "Original"){
+      sub3$Category[i] <- "Parent"
+    }
+    if(sub3$Community[i] == com & sub3$Comparison[i] == storage){
+      sub3$Category[i] <- "Reconstituted"
+    }
+  }
+  
+  sub3$Category <- factor(sub3$Category, levels = c("Reconstituted", "Parent", "Other Parent Communities"))
+  
+  plot <- ggplot(data = sub3, aes(Community, value, fill = Community)) + geom_boxplot() +
+    facet_grid(~Category, scales = "free", switch = "y", space = "free_x") +
+    labs(x = "Community\n", y = "Distance") + scale_fill_manual(values = brewer.pal(7, "Spectral")) +
+    ggtitle(paste("\n", storage, "-", com)) + theme(plot.title = element_text(hjust = 0.5))
+  return(plot)
+}
+
+# Make a plot that collects ALL the unique community plots in one consolidated figure, for glycerol storage.
+figure_glycerol <- plot_grid(bray.boxplot(df.recon.bray, com = coms[1]), bray.boxplot(df.recon.bray, com = coms[2]),
+                             bray.boxplot(df.recon.bray, com = coms[3]), bray.boxplot(df.recon.bray, com = coms[4]),
+                             bray.boxplot(df.recon.bray, com = coms[5]), bray.boxplot(df.recon.bray, com = coms[6]),
+                             bray.boxplot(df.recon.bray, com = coms[7]), ncol = 1)
+
+# Same as previous, but for lyophilized samples instead.
+figure_lyophilized <- plot_grid(bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[1]),
+                                bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[2]),
+                                bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[3]),
+                                bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[4]),
+                                bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[5]),
+                                bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[6]),
+                                bray.boxplot(df.recon.bray, storage = "Lyophilized", notstorage = "Glycerol", com = coms[7]),
+                                ncol = 1)
+                        
+# Collect these two figures together, glycerol on the left-hand side and lyophilized on the right.
+figure_full <- plot_grid(figure_glycerol, figure_lyophilized, ncol = 2)                    
+                        
+# View this consolidated figure.
+figure_full
+
+# Save the plot object.
+save_plot("../figures/Reconstituted_BCDistances_InterrepvsParent.pdf",
+          plot = figure_full, base_height = 20, base_width = 10.5, scale = 1.5)
+
+```
+
+# 3.8) Determining significant differences for the above sets of boxplots.
+
+In this code block, we want to see if the differences between replicates for each reconstituted community are
+significantly different (or not) from the distances to its parent community, as well as the distances to all other
+parent communities. Again, significances will be calculated using T-tests and Wilcoxon rank-sum tests.
+
+```{r 3.8-significance-interrepvsparent-bcdistances, message = FALSE, warning = FALSE}
+
+# Copy the phyloseq object for this comparison.
+df.recon.bray.forsig <- df.recon.bray
+
+df.recon.bray.forsig$Combination1 <- paste(df.recon.bray.forsig$StorageMethod1, df.recon.bray.forsig$Community1, sep = "_")
+df.recon.bray.forsig$Combination2 <- paste(df.recon.bray.forsig$Comparison, df.recon.bray.forsig$Community, sep = "_")
+df.recon.bray.noself <- df.recon.bray.forsig[df.recon.bray.forsig$Combination1 != df.recon.bray.forsig$Combination2,] 
+# ^ Get rid of self-self comparisons in this object.
+df.recon.bray.justself <- df.recon.bray.forsig[df.recon.bray.forsig$Combination1 == df.recon.bray.forsig$Combination2,] 
+# ^ Only have self-self comparisons in this object.
+
+# Get a dataframe of all possible combinations.
+combos <- expand.grid(Combination1 = unique(df.recon.bray.noself$Combination1), Combination2 = unique(df.recon.bray.noself$Combination2))
+
+# Initialize columns in this dataframe that we will fill in later.
+combos$Community <- "Blank"
+combos$InterreplicateMean <- "Blank"
+combos$BetweenMean <- "Blank"
+combos$T.Test.pvalue <- "Blank"
+combos$Wilcox.Test.pvalue <- "Blank"
+
+# We are only comparing the reconstituted to original (parent) communities, so get rid of 
+# anything that falls outside that match.
+combos <- subset(combos, grepl("Original", combos$Combination2))
+combos <- subset(combos, !grepl("Original", combos$Combination1))
+
+# Calculate the significance for t-test and Wilcox tests.
+for(i in 1:nrow(combos)){
+  
+  # Skip over self comparisons if any remain.
+  if(combos$Combination1[i] == combos$Combination2[i]){
+    next
+  }
+  
+  if(combos$Combination1[i] != combos$Combination2[i]){
+    
+    # Make a specific subset for the distances you want to compare; iterate over all possible combinations.
+    sub.noself <- subset(df.recon.bray.noself,
+                         df.recon.bray.noself$Combination1 == combos$Combination1[i] &
+                           df.recon.bray.noself$Combination2 == combos$Combination2[i])
+    sub.self <- subset(df.recon.bray.justself, df.recon.bray.justself$Combination1 == combos$Combination1[i])
+  
+    sub.self2 <- data.frame(sub.self)
+    sub.noself2 <- data.frame(sub.noself)
+    sub.self2$Category <- "Interreplicate"
+    sub.noself2$Category <- "BetweenCommunities"
+    
+    sub1 <- rbind(sub.self2, sub.noself2)
+    
+    # Calculate the significances and add them to the dataframe.
+    x <- t.test(value~Category, data = sub1)
+    combos$T.Test.pvalue[i] <- x$p.value
+    combos$InterreplicateMean[i] <- x$estimate[1]
+    combos$BetweenMean[i] <- x$estimate[2]
+    combos$Wilcox.Test.pvalue[i] <- wilcox.test(value~Category, data = sub1)$p.value
+  }
+}
+
+# Order the combinations and subset them to only retain the NON-SIGNIFICANT comparisons.
+# We assume most everything is significantly different, we DO want to know which comparisons are
+# statistically similar; using a cutoff of pvalue > 0.05.
+combos <- combos[order(combos$Combination1),]
+combos$T.Test.pvalue <- as.numeric(combos$T.Test.pvalue)
+combos$Wilcox.Test.pvalue <- as.numeric(combos$Wilcox.Test.pvalue)
+combos.sig <- subset(combos, combos$T.Test.pvalue > 0.05 | combos$Wilcox.Test.pvalue > 0.05)
+
+combos.sig
+
+# Write a table.
+write.table(combos.sig, "../figures/Reconstituted_BCDistances_InterrepvsParent_nonsignficantcomparisons.txt",
+            sep = "\t", row.names = FALSE)
+
+```
+
+# 3.9) Reconstituted Interreplicate Distances vs. Parent Communities for C2, including generation II.
+
+This code block replicates much of what was done in sections 3.7 and 3.8, with the exception of focusing
+on the C2 community (10^-4 Part C) and including the second generation as well.
+
+```{r 3.9-c2-reconstitutedvsparentdistances, fig.height = 4, fig.width = 6}
+
+# Generate a new object specifically for this comparison. We modified the sample data of the rar.recon
+# object for a previous analysis, we don't want that here, so we're just making a new object rather
+# than modifying everything back.
+rar.recon2 <- rarefy_even_depth(unrar.recon, rngseed = 711, sample.size = recon.rardepth)
+
+# Graph PCoA distances in the Bray-Curtis distance object.
+justc2.bray <- rar.recon2 %>% otu_table %>% as("matrix") %>% t %>%
+   vegdist(method="bray", binary=T, diag=F, na.rm = FALSE) %>%
+   as.matrix %>% reshape2::melt(varnames = c("one", "two"))
+
+recon.metadata <- data.frame(sample_data(rar.recon2))
+
+# Edit this dataframe to include the metadata.
+for(i in 1:nrow(justc2.bray)){
+  
+  one <- as.character(justc2.bray$one[i])
+  two <- as.character(justc2.bray$two[i])
+  
+  justc2.bray$StorageMethod1[i] <- (as.character(recon.metadata[rownames(recon.metadata) == one, 1]))
+  justc2.bray$Community1[i] <- (as.character(recon.metadata[rownames(recon.metadata) == one, 2]))
+  justc2.bray$IsolationRep1[i] <- (as.character(recon.metadata[rownames(recon.metadata) == one, 3]))
+  
+  justc2.bray$Comparison[i] <- (as.character(recon.metadata[rownames(recon.metadata) == two, 1]))
+  justc2.bray$Community2[i] <- (as.character(recon.metadata[rownames(recon.metadata) == two, 2]))
+  justc2.bray$IsolationRep2[i] <- (as.character(recon.metadata[rownames(recon.metadata) == two, 3]))
+}
+
+# Subset this so you only get the comparisons between identical communities. Also get rid of self-comparisons.
+justc2.bray <- justc2.bray[justc2.bray$value != 0.0000000,]
+colnames(justc2.bray)[colnames(justc2.bray) == "Community2"] <- "Community"
+justc2.bray$Community <- factor(justc2.bray$Community, levels = levels(noc2.metadata$Community))
+
+# Make a function to get a specific community and reconstitution method to focus on.
+bray.boxplot <- function(justc2.bray, storage = "Glycerol", notstorage = "Lyophilized", com = "C2"){
+  sub1 <- subset(justc2.bray, Community1 == com & StorageMethod1 == storage)
+  sub2 <- subset(sub1, Comparison == "Original" | Comparison == "C2" | Community == com)
+  # sub2 <- subset(sub1, Community == com)
+  sub3 <- subset(sub2, Comparison != notstorage)
+  
+  for(i in 1:nrow(sub3)){
+    if(sub3$Community[i] != com){
+      sub3$Category[i] <- "Other Parent Communities"
+    }
+    if(sub3$Community[i] == com & sub3$Comparison[i] == "Original"){
+      sub3$Category[i] <- "Parent"
+    }
+    if(sub3$Community[i] == com & sub3$Comparison[i] == "GenerationII"){
+      sub3$Category[i] <- "Generation 2"
+    }
+    if(sub3$Community[i] == com & sub3$Comparison[i] == storage){
+      sub3$Category[i] <- "Generation 1"
+    }
+  }
+  
+  sub3$Category <- factor(sub3$Category, levels = c("Parent", "Generation 1", "Generation 2", "Other Parent Communities"))
+  
+  plot <- ggplot(data = sub3, aes(Community, value, fill = Community)) + geom_boxplot() +
+    facet_grid(~Category, scales = "free", switch = "y", space = "free_x") +
+    labs(x = "Community\n", y = "Distance") + scale_fill_manual(values = brewer.pal(7, "Spectral")) +
+    ggtitle(paste("\n", storage, "-", com)) + theme(plot.title = element_text(hjust = 0.5))
+  return(plot)
+}
+
+# Generate one plot for glycerol samples, another for lyophilized samples, then bind them together and save it.
+c2plot_gly <- bray.boxplot(justc2.bray)
+c2plot_ly <- bray.boxplot(justc2.bray, storage = "Lyophilized", notstorage = "Glycerol")
+c2plot <- plot_grid(c2plot_gly, c2plot_ly, ncol = 1)
+
+# View the plot.
+c2plot
+
+# Save the plot.
+save_plot("../figures/Reconstituted_BCDistances_C2Only.pdf", c2plot, base_height = 8, base_width = 6, scale = 1.5)
+
+# Determining significant differences including the C2 samples.
+
+## Significance tests.
+# Doing t-tests for each subset.
+# justc2.bray3 <- justc2.bray
+# justc2.bray3$Combination1 <- paste(justc2.bray3$StorageMethod1, justc2.bray$Community1, sep = "_")
+# justc2.bray3$Combination2 <- paste(justc2.bray3$Comparison, justc2.bray3$Community, sep = "_")
+# justc2.bray.noself <- justc2.bray3[justc2.bray3$Combination1 != justc2.bray3$Combination2,] # Get rid of self-self comparisons
+# justc2.bray.justself <- justc2.bray3[justc2.bray3$Combination1 == justc2.bray3$Combination2,] # Only have self-self comparisons
+# 
+# # Get a dataframe of all possible combinations.
+# combos <- expand.grid(Combination1 = unique(justc2.bray.noself$Combination1), Combination2 = unique(justc2.bray.noself$Combination2))
+# combos$Community <- "Blank"
+# combos$InterreplicateMean <- "Blank"
+# combos$BetweenMean <- "Blank"
+# combos$T.Test.pvalue <- "Blank"
+# combos$Wilcox.Test.pvalue <- "Blank"
+# #combos <- subset(combos, combos$Combination1 != combos$Combination2)
+# combos <- subset(combos, grepl("Original|C2", combos$Combination2))
+# combos <- subset(combos, !grepl("Original", combos$Combination1))
+# dim(combos)
+# 
+# for(i in 1:nrow(combos)){
+# 
+#   if(combos$Combination1[i] == combos$Combination2[i]){
+#     next
+#   }
+# 
+#   if(combos$Combination1[i] != combos$Combination2[i]){
+#     sub.noself <- subset(justc2.bray.noself, justc2.bray.noself$Combination1 == combos$Combination1[i] & justc2.bray.noself$Combination2 == combos$Combination2[i])
+#     sub.self <- subset(justc2.bray.justself, justc2.bray.justself$Combination1 == combos$Combination1[i])
+# 
+#     sub.self2 <- data.frame(sub.self)
+#     sub.noself2 <- data.frame(sub.noself)
+#     sub.self2$Category <- "Interreplicate"
+#     sub.noself2$Category <- "BetweenCommunities"
+# 
+#   # sub.noself$Category <- "BetweenCommunities"
+#   # sub.self$Category <- "Interreplicate"
+#     sub1 <- rbind(sub.self2, sub.noself2)
+#     print(combos$Combination1[i], max.levels = 0)
+#     print(combos$Combination2[i], max.levels = 0)
+# 
+#     x <- t.test(value~Category, data = sub1)
+#     combos$T.Test.pvalue[i] <- x$p.value
+#     combos$InterreplicateMean[i] <- x$estimate[1]
+#     combos$BetweenMean[i] <- x$estimate[2]
+#     print("wilcoxon test p.value =")
+#     combos$Wilcox.Test.pvalue[i] <- wilcox.test(value~Category, data = sub1)$p.value
+#   }
+# 
+#   # y <- data.frame(Community = com, GlycerolAvg = glymean, LyophilizedAvg = lymean, t.test.p.value = t.p, wilcox.test.p.value = w.p)
+#   # sig.results <- rbind(sig.results, y)
+# }
+# 
+# combos <- combos[order(combos$Combination1),]
+# combos$T.Test.pvalue <- as.numeric(combos$T.Test.pvalue)
+# combos$Wilcox.Test.pvalue <- as.numeric(combos$Wilcox.Test.pvalue)
+# combos.sig <- subset(combos, combos$T.Test.pvalue > 0.05 | combos$Wilcox.Test.pvalue > 0.05)
+# 
+# View(combos.sig)
+
+```
+
+
+## 4) Investigating the effects of incubating soils with C2 consortia under different conditions. 
+
+In this set of experiments, we incubated the C2 consortium in soil under distinct perturbations representing
+abiotic stresses of a sort: 1) standard conditions of soil + 100 ppm chitin, 2) 'no inoculation', i.e. soil w/o C2,
+3) 'no chitin', or soil without 100 ppm chitin (all other soil inoculations include it as a C source),
+4) low temp (10°C), 5) high temp (37°C), 6) salt stress, and 7) addition of herbicide (2,4-dichlorophenoxyacetic acid). 
+
+Soil samples were taken once a week from weeks 1 - 5 of incubation (with an additional set of time 0 samples for
+standard, low temp, and high temp treatments), and community composition analyzed.
+
+# 4.1) Import the soil incubation data (biom/tree files).
+
+```{r 4.1-soilincubation-import, eval = T, include = F}
+
+# Import the biom/tree and metadata files.
+unrar.soil <- import_biom("../data/soilincubations.biom", "../data/soilincubations.tree")
+metadata.soil <- read.table("../data/soilincubations_metadata.txt", header = TRUE)
+unrar.soil <- prune_samples(as.character(metadata.soil$Annotation_ID), unrar.soil)
+# Note: there are some samples that likely failed or were below the quality threshold;
+# which is why the metadata sheet has more samples than you see in the pruned unrar.soil object.
+
+# Make the metadata file appropriate for use in Phyloseq.
+rownames(metadata.soil) <- metadata.soil$Annotation_ID
+metadata.soil <- sample_data(metadata.soil)
+
+# Merge the metadata into one phyloseq object.
+unrar.soil <- merge_phyloseq(unrar.soil, metadata.soil)
+
+# Add levels to the metadata factors.
+sample_data(unrar.soil)$Replicate <- factor(sample_data(unrar.soil)$Replicate,
+                                        levels = sort(unique(sample_data(unrar.soil)$Replicate)))
+sample_data(unrar.soil)$WeeksIncubated <- factor(sample_data(unrar.soil)$WeeksIncubated,
+                                             levels = sort(unique(sample_data(unrar.soil)$WeeksIncubated)))
+sample_data(unrar.soil)$Treatment <- factor(sample_data(unrar.soil)$Treatment,
+                                            levels = c("Standard", "NoInoculation", "NoChitin",
+                                                       "LowTemp", "HighTemp", "SaltStress", "Herbicide"))
+
+# Rename the tax_table.
+colnames(tax_table(unrar.soil)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax_table(unrar.soil) <- gsub("^.__", "", tax_table(unrar.soil))
+
+# Rarefy this object.
+rar.soil <- rarefy_even_depth(unrar.soil, rngseed = 711, sample.size = 1000)
+# ^ Removes 9 samples; remove the sample.size argument to keep everything, but you're going to severely
+# diminish the size of your dataset then.
+
+```
+
+# 4.2) Order-level Relative Abundance plot.
+
+To visualize the changes in community composition over time, we will create a relative abundance
+table at the order level.
+
+```{r 4.2-soilincubation-order-relabundance, eval = T, fig.height = 6, fig.width = 8}
+
+# This is a function that takes in a phyloseq object and returns the top 'n' number of phyla 
+# (or whichever taxonomic level you specify) in a melted table with abundances of each phyla per sample.
+
+relabundance_melttable <- function(phy, n = 10, rank = "Phylum", species = FALSE){
+  
+  # If the taxa is labeled with a prefix (e.g. p__Proteobacteria rather than Proteobacteria),
+  # we can get rid of that here.
+  tax_table(phy)[,rank] <- gsub("^.__", "", tax_table(phy)[,rank])
+  
+  # Determine what the top n phyla are. Doing 'n+1' in order to capture the unknown ('?') phylum.
+  top_taxa <- as.list(sort(tapply(taxa_sums(phy), tax_table(phy)[,rank], sum), TRUE)[1:(n+1)]) %>% names()
+ 
+  # If one of the top_taxa is unknown, we want to remove it from this list.
+  top_taxa <- top_taxa[top_taxa != "?"]
+  
+  # If not, we want to remove the extra element so we only have n elements in this list.
+  if(length(top_taxa) > n){
+    top_taxa <- top_taxa[1:(length(top_taxa) - 1)]
+  }
+  # print(top_taxa)
+  
+  # Rename the taxa that aren't in the top n to just be "Other".
+  tax_table(phy)[!tax_table(phy)[,rank] %in% top_taxa,rank] <- "Other"
+  
+  if(rank != "Species" & species == FALSE){
+    tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+  }
+  
+  if(species == TRUE){
+    top_taxa <- top_taxa[top_taxa != "Other"]
+    print(top_taxa)
+    tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+  }
+    
+  # In order for us to glom successfully, we need to remove the columns prior to the taxrank we're using. E.g. if using 'Class',
+  # we need to remove 'Domain' and 'Phylum'.
+  tax_table(phy) <- tax_table(phy)[,which(colnames(tax_table(phy)) == rank):length(colnames(tax_table(phy)))]
+  
+  phy.glom <- tax_glom(phy, taxrank = rank)
+  taxa_names(phy.glom) <- tax_table(phy.glom)[,rank]
+
+  
+  if(taxa_are_rows(phy.glom) == TRUE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(t(otu_table(phy.glom))))
+  }
+  
+  if(taxa_are_rows(phy.glom) == FALSE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(otu_table(phy.glom)))
+  }
+  
+  if("Replicate" %in% colnames(glom.table)){
+    glom.table$Replicate <- as.character(glom.table$Replicate)
+  }
+  
+  glom.melt <- melt(data = glom.table, value.name = "Abundance", variable.name = rank)
+
+  # Remove any NAs.
+  glom.melt <- glom.melt[!is.na(glom.melt[,rank]),]
+  
+  # Having a minor issue with Actinobacteria as a class becoming an NA down the line.
+  glom.melt[,rank] <- gsub("\\.class\\.", "\\(class\\)", glom.melt[,rank])
+
+  # Relevel the taxrank so 'Other' is last.
+  glom.melt[,rank] <- factor(glom.melt[,rank], levels = c(sort(top_taxa), "Other"))
+  
+  return(glom.melt)
+}
+
+# Generate the melted order-level dataframe.
+soil.order.melt <- relabundance_melttable(rar.soil, n = 10, rank = "Order")
+
+# Generate a plette to use for this.
+soil.order.palette <- c(viridis(5), rev(magma(5)), "gray34")
+
+## Order-level plot.
+soilincubation_orderplot <- ggplot(data=soil.order.melt,aes(x=Replicate,y=Abundance,fill=Order)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_grid(Treatment ~ WeeksIncubated, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = soil.order.palette, drop = FALSE) +
+  theme(axis.text.x=element_text(size = 16, color = "black", hjust = 1),
+        axis.text.y=element_text(size=10,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_text(size = 24, face = "bold"),
+        text=element_text(size=18)) +
+  xlab("\nWeeks Incubated by Replicate") + ylab("Relative Abundance\n") + theme(panel.spacing = unit(1, "lines")) +
+  theme(legend.text = element_text(size = 24), plot.title = element_text(size = 30, face = "bold", hjust = 0.5)) +
+  ggtitle("Order-Level Relative Abundance for all C2 in Soil") + guides(fill = guide_legend(ncol = 1))
+
+# View the plot.
+soilincubation_orderplot
+
+# Save the plot.
+save_plot("../figures/SoilIncubation_OrderRelativeAbundance.pdf", plot = soilincubation_orderplot, base_width = 8, base_height = 6, scale = 2)
+
+```
+
+# 4.3) Indicator species analysis for the soil incubation dataset.
+
+In this code block, we're using indicator species analysis (set at the 'Genus' level, but can be
+fine-tuned to any taxonomic ranking) to see which taxa are significantly associated with the timepoint 'Week 5',
+i.e. to see what emerges at later timepoints in each treatment.
+
+```{r 4.3-indicator-species-analysis-week5}
+
+# Investigating what the various genera / orders / whichever taxonomic levels are
+# significantly associated with week 5 for all treatments. Making separate subsets by
+# treatment of the original phyloseq object to conduct this analysis - if we run indicator species
+# analysis with all of them together, there is less power for any single week 5 x treatment
+# combination in determining what significant taxa emerge.
+
+# Make subset phyloseq objects for each of the treatments.
+soil.ht <- subset_samples(rar.soil, Treatment == "HighTemp")
+soil.ni <- subset_samples(rar.soil, Treatment == "NoInoculation")
+soil.nc <- subset_samples(rar.soil, Treatment == "NoChitin")
+soil.lt <- subset_samples(rar.soil, Treatment == "LowTemp")
+soil.st <- subset_samples(rar.soil, Treatment == "Standard")
+soil.ss <- subset_samples(rar.soil, Treatment == "SaltStress")
+soil.hb <- subset_samples(rar.soil, Treatment == "Herbicide")
+
+# Function for generating indicator genera (or other taoxnomic ranks) for a given factor and treatment.
+isa <- function(sp.rar, rank = "Genus", factor = "WeeksIncubated", treatment = "HighTemp"){
+  
+  # Make a glommed phyloseq object by the specific taxonomic rank.
+  phy.glom <- tax_glom(sp.rar, taxrank = rank)
+
+  # Making the data frames that are the necessary components for the function.
+  # Starting with the taxonomy table.
+  i <- match(rank, colnames(tax_table(phy.glom)))
+  df.tax <- data.frame(tax_table(phy.glom)[,1:i])
+
+  
+  df.otu <- t(data.frame(otu_table(phy.glom))) # <- t() is there because we need to transpose species and samples for indval().
+  df.otu <- df.otu[order(rownames(df.otu)),]
+
+  # Remove the OTUs that are zeros in all samples.
+  df.otu <- df.otu[,!apply(df.otu==0,2,all)]
+
+  # Get the necessary metadata.
+  df.metadata <- data.frame(sample_data(phy.glom))
+  df.metadata <- df.metadata[order(rownames(df.metadata)),]
+
+  # Make dataframes for the grouping variable and a number to assign to them.
+  factor_index <- match(factor, colnames(df.metadata))
+  grouping <- data.frame(Name = df.metadata[,factor_index], Num = as.numeric(as.factor(df.metadata[,factor_index])))
+
+  # Run the indicator species for each of the factors of interest.
+  modname <- indval(df.otu, grouping$Num)
+
+  # Now for some more in-depth analysis.
+
+  # Module Name first.
+  gr.modname <- modname$maxcls[modname$pval<=0.05]
+  iv.modname <- modname$indcls[modname$pval<=0.05]
+  pv.modname <- modname$pval[modname$pval<=0.05]
+  fr.modname <- apply(df.otu[,]>0, 2, sum)[modname$pval<=0.05]
+  modname.summary <- data.frame(group = gr.modname, indval = iv.modname, pvalue = pv.modname, freq = fr.modname)
+  modname.summary <- modname.summary[order(modname.summary$group, -modname.summary$indval),]
+
+  for(i in 1:nrow(modname.summary)){
+    x <- modname.summary$group[i]
+    y <- as.character(unique(grouping[grouping$Num == x, 1]))
+    modname.summary$group2[i] <- y
+  }
+  
+  # Add in the taxonomy.
+  modname.tax <- df.tax[rownames(modname.summary),]
+  modname.summary <- cbind(modname.summary, modname.tax) # Now you can go through and look at this
+  # in more detail to see indicator genera by taxonomy.
+
+  for(i in 1:nrow(modname.summary)){
+    if(!grepl("_", modname.summary$group2[i])){
+      modname.summary$group2[i] <- paste(factor, modname.summary$group2[i], sep = "_")
+    }
+  }
+  
+  # Label which of the various treatments this phyloseq object belongs to.
+  modname.summary$group <- treatment
+    
+  return(modname.summary)
+}
+
+
+# Generate tables for the various indicators.
+
+# Start with genus.
+genus_indicators <- rbind(isa(soil.ht, rank = "Genus", treatment = "HighTemp"),
+                          isa(soil.ni, rank = "Genus", treatment = "NoInoculation"),
+                          isa(soil.nc, rank = "Genus", treatment = "NoChitin"),
+                          isa(soil.lt, rank = "Genus", treatment = "LowTemp"),
+                          isa(soil.st, rank = "Genus", treatment = "Standard"),
+                          isa(soil.ss, rank = "Genus", treatment = "SaltStress"),
+                          isa(soil.hb, rank = "Genus", treatment = "Herbicide"))
+genus_indicators_week5 <- genus_indicators[genus_indicators$group2 == "WeeksIncubated_5",]
+colnames(genus_indicators_week5)[colnames(genus_indicators) == "group"] <- "Treatment"
+colnames(genus_indicators_week5)[colnames(genus_indicators) == "group2"] <- "WeeksIncubated"
+
+write.table(genus_indicators_week5, "../figures/IncubatedSoil_GenusIndicators_Week5.txt", sep = "\t", col.names = NA)
+
+  ##########################################################
+  ### Other taxonomic rankings (not used for the paper). ###
+  ##########################################################
+
+# # Now Family.
+# family_indicators <- rbind(isa(sp.ht, rank = "Family", treatment = "HighTemp"),
+#                           isa(sp.ni, rank = "Family", treatment = "NoInoculation"),
+#                           isa(sp.nc, rank = "Family", treatment = "NoChitin"),
+#                           isa(sp.lt, rank = "Family", treatment = "LowTemp"),
+#                           isa(sp.st, rank = "Family", treatment = "Standard"),
+#                           isa(sp.ss, rank = "Family", treatment = "SaltStress"),
+#                           isa(sp.hb, rank = "Family", treatment = "Herbicide"))
+# family_indicators_week5 <- family_indicators[family_indicators$group2 == "WeeksIncubated_5",]
+# colnames(family_indicators_week5)[colnames(family_indicators) == "group"] <- "Treatment"
+# colnames(family_indicators_week5)[colnames(family_indicators) == "group2"] <- "WeeksIncubated"
+# 
+# # Now Order.
+# order_indicators <- rbind(isa(sp.ht, rank = "Order", treatment = "HighTemp"),
+#                           isa(sp.ni, rank = "Order", treatment = "NoInoculation"),
+#                           isa(sp.nc, rank = "Order", treatment = "NoChitin"),
+#                           isa(sp.lt, rank = "Order", treatment = "LowTemp"),
+#                           isa(sp.st, rank = "Order", treatment = "Standard"),
+#                           isa(sp.ss, rank = "Order", treatment = "SaltStress"),
+#                           isa(sp.hb, rank = "Order", treatment = "Herbicide"))
+# order_indicators_week5 <- order_indicators[order_indicators$group2 == "WeeksIncubated_5",]
+# colnames(order_indicators_week5)[colnames(order_indicators) == "group"] <- "Treatment"
+# colnames(order_indicators_week5)[colnames(order_indicators) == "group2"] <- "WeeksIncubated"
+# 
+# # Now Class.
+# class_indicators <- rbind(isa(sp.ht, rank = "Class", treatment = "HighTemp"),
+#                           isa(sp.ni, rank = "Class", treatment = "NoInoculation"),
+#                           isa(sp.nc, rank = "Class", treatment = "NoChitin"),
+#                           isa(sp.lt, rank = "Class", treatment = "LowTemp"),
+#                           isa(sp.st, rank = "Class", treatment = "Standard"),
+#                           isa(sp.ss, rank = "Class", treatment = "SaltStress"),
+#                           isa(sp.hb, rank = "Class", treatment = "Herbicide"))
+# class_indicators_week5 <- class_indicators[class_indicators$group2 == "WeeksIncubated_5",]
+# colnames(class_indicators_week5)[colnames(class_indicators) == "group"] <- "Treatment"
+# colnames(class_indicators_week5)[colnames(class_indicators) == "group2"] <- "WeeksIncubated"
+# 
+# # Now Phylum
+# phylum_indicators <- rbind(isa(sp.ht, rank = "Phylum", treatment = "HighTemp"),
+#                           isa(sp.ni, rank = "Phylum", treatment = "NoInoculation"),
+#                           isa(sp.nc, rank = "Phylum", treatment = "NoChitin"),
+#                           isa(sp.lt, rank = "Phylum", treatment = "LowTemp"),
+#                           isa(sp.st, rank = "Phylum", treatment = "Standard"),
+#                           isa(sp.ss, rank = "Phylum", treatment = "SaltStress"),
+#                           isa(sp.hb, rank = "Phylum", treatment = "Herbicide"))
+# phylum_indicators_week5 <- phylum_indicators[phylum_indicators$group2 == "WeeksIncubated_5",]
+# colnames(phylum_indicators_week5)[colnames(phylum_indicators) == "group"] <- "Treatment"
+# colnames(phylum_indicators_week5)[colnames(phylum_indicators) == "group2"] <- "WeeksIncubated"
+# 
+# library("writexl")
+# 
+# indicator_sheets <- list("genus" = genus_indicators_week5, "family" = family_indicators_week5, "order" = order_indicators_week5,
+#                          "class" = class_indicators_week5, "phylum" = phylum_indicators_week5)
+# 
+# write_xlsx(indicator_sheets,
+# "/Users/nayl574/Google Drive/SSFA_FY18_Consortia/amplicon-analysis/2019_11_22_dan_michellesC2isolates/2020_02_16_figures/indicators.xlsx")
+
+```
+
+# 5) Network analysis.
+
+# 5.1) Generating Co-Abundance Networks for Cytoscape.
+
+```{r 5.1-generatingcoabundancenetworks-forcytoscape, eval = F}
+
+# Import the table of species abundances used for this analysis.
+species.table <- read.table("../data/C2_Soil_Counts_for_Pearson.csv", header=TRUE, sep=",", quote="", stringsAsFactors=FALSE)
+correlation <- cor(species.table, use="all.obs", method="pearson")
+
+
+##Generate network based on Pearson correlation coeffecient absolute values##
+filterAndCreateNetwork <- function(cutoffs = 0.35, adjMatWht = correlation){
+  cutoffs <- c(0.35)
+  
+  for(n in (1:length(cutoffs))){
+    adjMat <- adjMatWht
+    minZVal <- cutoffs[n]
+    diag(adjMat) <- 0
+    adjMat <- abs(adjMat) 
+    
+    adjMat[adjMat < minZVal] <- 0
+    adjMat[adjMat >= minZVal] <- 1
+    
+    modePicked <- "undirected"
+    g <- graph.adjacency(adjMat, mode= modePicked) 
+    # print(modePicked)
+    g <- delete.vertices(g, which(degree(g) == 0))
+    
+    outputData <- get.edgelist(g)
+    
+    outputData <- cbind(outputData[, 1], "C", outputData[, 2])
+    
+    # Note: this function directly writes a table, so modify the extension below as appropriate.
+    outputFilePath <- sprintf("../data/NetworkforCytoscape_FuncMod_CLR_Unwht_%s.sif", minZVal)
+    write.table(outputData, file=outputFilePath, quote=FALSE, sep=" ", row.names=FALSE, col.names=FALSE)
+  }
+}
+
+filterAndCreateNetwork()
+
+```
+
